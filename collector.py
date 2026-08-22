@@ -1,19 +1,24 @@
 import os
 import time
+import csv
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 API_KEY = os.environ["COINALYZE_API_KEY"]
-HEADERS = {"api_key": API_KEY}
+
+HEADERS = {
+    "api_key": API_KEY
+}
+
 BASE = "https://api.coinalyze.net/v1"
 
-# Binance ETH/USDT perpetual — пока используем
-# как контрольную цену ETH.
+HOURS = 168
+
 PRICE_SYMBOL = "ETHUSDT_PERP.A"
 
 
 # ==================================================
-# ПОСЛЕДНИЙ ПОЛНОСТЬЮ ЗАКРЫТЫЙ ЧАС UTC
+# TIME RANGE
 # ==================================================
 
 now = datetime.now(timezone.utc)
@@ -24,37 +29,38 @@ current_hour = now.replace(
     microsecond=0
 )
 
-bucket_start = int(current_hour.timestamp()) - 3600
-bucket_end = bucket_start + 3599
+# Последний полностью закрытый bucket
+last_bucket = current_hour - timedelta(hours=1)
 
-bucket_label = datetime.fromtimestamp(
-    bucket_start,
-    tz=timezone.utc
-).strftime("%Y-%m-%d %H:%M UTC")
+# Нужны 168 закрытых часов включая последний
+first_bucket = last_bucket - timedelta(hours=HOURS - 1)
+
+from_ts = int(first_bucket.timestamp())
+to_ts = int(last_bucket.timestamp()) + 3599
 
 
 # ==================================================
-# ЗАПРОС К COINALYZE API
-# С АВТОМАТИЧЕСКОЙ ОБРАБОТКОЙ RATE LIMIT
+# API REQUEST WITH RATE-LIMIT HANDLING
 # ==================================================
 
 def api_get(endpoint, params=None):
 
     while True:
 
-        r = requests.get(
+        response = requests.get(
             f"{BASE}/{endpoint}",
             headers=HEADERS,
             params=params,
-            timeout=30,
+            timeout=60
         )
 
-        # Coinalyze может вернуть Retry-After
-        # дробным числом, например 58.803
-        if r.status_code == 429:
+        if response.status_code == 429:
 
             wait = float(
-                r.headers.get("Retry-After", "60")
+                response.headers.get(
+                    "Retry-After",
+                    "60"
+                )
             )
 
             print(
@@ -66,69 +72,64 @@ def api_get(endpoint, params=None):
 
             continue
 
-        r.raise_for_status()
+        response.raise_for_status()
 
-        return r.json()
+        return response.json()
 
 
 # ==================================================
-# ПОЛУЧАЕМ СПИСОК ФЬЮЧЕРСНЫХ РЫНКОВ
+# MARKET LIST
 # ==================================================
 
 markets = api_get("future-markets")
 
 
-# ==================================================
-# ВЫБИРАЕМ ETH-КОНТРАКТЫ
-#
-# Используем USD / USDT / BUSD,
-# чтобы приблизиться к агрегату ETH Coinalyze.
-# ==================================================
-
+# Те же базовые типы контрактов, которые
+# Coinalyze указывает для ETH aggregated OI.
 eth_markets = [
-    m
-    for m in markets
-    if m.get("base_asset") == "ETH"
-    and m.get("quote_asset") in (
+    market
+    for market in markets
+    if market.get("base_asset") == "ETH"
+    and market.get("quote_asset") in (
         "USD",
         "USDT",
         "BUSD"
     )
 ]
 
-symbols = [
-    m["symbol"]
-    for m in eth_markets
+
+all_symbols = [
+    market["symbol"]
+    for market in eth_markets
 ]
 
 
+perpetual_symbols = [
+    market["symbol"]
+    for market in eth_markets
+    if market.get("is_perpetual") is True
+]
+
+
+ls_symbols = [
+    market["symbol"]
+    for market in eth_markets
+    if market.get("has_long_short_ratio_data") is True
+]
+
+
+print("ETH contracts:", len(all_symbols))
+print("Perpetual contracts:", len(perpetual_symbols))
+print("L/S supported contracts:", len(ls_symbols))
+
+
 # ==================================================
-# РАЗДЕЛЯЕМ PERPETUAL И FUTURES
+# HISTORY REQUEST
 # ==================================================
 
-perpetual_symbols = {
-    m["symbol"]
-    for m in eth_markets
-    if m.get("is_perpetual") is True
-}
-
-future_symbols = {
-    m["symbol"]
-    for m in eth_markets
-    if m.get("is_perpetual") is False
-}
-
-
-# ==================================================
-# УНИВЕРСАЛЬНАЯ ЗАГРУЗКА ИСТОРИИ
-#
-# Coinalyze позволяет максимум 20 symbols
-# в одном HTTP-запросе.
-# ==================================================
-
-def history_for_symbols(
+def get_history(
     endpoint,
-    symbols_list,
+    symbols,
     extra=None
 ):
 
@@ -136,21 +137,21 @@ def history_for_symbols(
 
     batch_size = 20
 
-    for i in range(
+    for start in range(
         0,
-        len(symbols_list),
+        len(symbols),
         batch_size
     ):
 
-        batch = symbols_list[
-            i:i + batch_size
+        batch = symbols[
+            start:start + batch_size
         ]
 
         params = {
             "symbols": ",".join(batch),
             "interval": "1hour",
-            "from": bucket_start,
-            "to": bucket_end,
+            "from": from_ts,
+            "to": to_ts
         }
 
         if extra:
@@ -163,270 +164,506 @@ def history_for_symbols(
 
         for item in data:
 
-            history = item.get(
+            symbol = item["symbol"]
+
+            result[symbol] = {}
+
+            for row in item.get(
                 "history",
                 []
-            )
+            ):
 
-            if history:
-
-                result[
-                    item["symbol"]
-                ] = history[-1]
+                result[symbol][
+                    row["t"]
+                ] = row
 
     return result
 
 
 # ==================================================
-# 1. OPEN INTEREST
+# DOWNLOAD DATA
 # ==================================================
 
-oi = history_for_symbols(
+print("")
+print("Downloading OI...")
+
+oi_history = get_history(
     "open-interest-history",
-    symbols,
+    all_symbols,
     {
         "convert_to_usd": "true"
-    },
+    }
 )
 
 
-perpetual_oi = sum(
-    row["c"]
-    for symbol, row in oi.items()
-    if symbol in perpetual_symbols
-)
+print("Downloading liquidations...")
 
-
-futures_oi = sum(
-    row["c"]
-    for symbol, row in oi.items()
-    if symbol in future_symbols
-)
-
-
-all_oi = (
-    perpetual_oi
-    + futures_oi
-)
-
-
-# ==================================================
-# 2. LIQUIDATIONS
-#
-# l = Long liquidations
-# s = Short liquidations
-# ==================================================
-
-liq = history_for_symbols(
+liq_history = get_history(
     "liquidation-history",
-    symbols,
+    all_symbols,
     {
         "convert_to_usd": "true"
-    },
+    }
 )
 
 
-total_long_liq = sum(
-    row.get("l", 0)
-    for row in liq.values()
+print("Downloading funding...")
+
+funding_history = get_history(
+    "funding-rate-history",
+    perpetual_symbols
 )
 
 
-total_short_liq = sum(
-    row.get("s", 0)
-    for row in liq.values()
+print("Downloading L/S ratio...")
+
+ls_history = get_history(
+    "long-short-ratio-history",
+    ls_symbols
 )
 
 
-# ==================================================
-# 3. ETH PRICE
-#
-# Пока используем Binance ETHUSDT perpetual.
-# После проверки агрегатов сделаем
-# Coinalyze-like Average Price.
-# ==================================================
+print("Downloading price...")
 
-price_data = history_for_symbols(
+price_history = get_history(
     "ohlcv-history",
-    [PRICE_SYMBOL],
-)
-
-
-price = price_data.get(
-    PRICE_SYMBOL
+    [PRICE_SYMBOL]
 )
 
 
 # ==================================================
-# ФОРМАТИРОВАНИЕ
+# BUILD HOURLY DATABASE
 # ==================================================
 
-def billions(value):
+rows = []
 
-    return (
-        f"${value / 1_000_000_000:.3f}B"
+previous_oi = None
+
+
+for hour_index in range(HOURS):
+
+    bucket_dt = (
+        first_bucket
+        + timedelta(hours=hour_index)
+    )
+
+    timestamp = int(
+        bucket_dt.timestamp()
     )
 
 
-def millions(value):
+    # ----------------------------------------------
+    # OPEN INTEREST
+    # ----------------------------------------------
 
-    return (
-        f"${value / 1_000_000:.3f}M"
+    oi_values = []
+
+    for symbol in all_symbols:
+
+        row = (
+            oi_history
+            .get(symbol, {})
+            .get(timestamp)
+        )
+
+        if row is not None:
+
+            value = row.get("c")
+
+            if value is not None:
+                oi_values.append(value)
+
+
+    total_oi = (
+        sum(oi_values)
+        if oi_values
+        else None
     )
 
 
-def thousands(value):
+    # ----------------------------------------------
+    # LIQUIDATIONS
+    # ----------------------------------------------
 
-    return (
-        f"${value / 1_000:.3f}K"
+    total_short_liq = 0.0
+    total_long_liq = 0.0
+
+    liq_count = 0
+
+
+    for symbol in all_symbols:
+
+        row = (
+            liq_history
+            .get(symbol, {})
+            .get(timestamp)
+        )
+
+        if row is not None:
+
+            total_short_liq += (
+                row.get("s", 0) or 0
+            )
+
+            total_long_liq += (
+                row.get("l", 0) or 0
+            )
+
+            liq_count += 1
+
+
+    if liq_count == 0:
+
+        total_short_liq = None
+        total_long_liq = None
+
+
+    # ----------------------------------------------
+    # FUNDING
+    # ----------------------------------------------
+
+    funding_values = []
+
+
+    for symbol in perpetual_symbols:
+
+        row = (
+            funding_history
+            .get(symbol, {})
+            .get(timestamp)
+        )
+
+        if row is not None:
+
+            value = row.get("c")
+
+            if value is not None:
+
+                funding_values.append(
+                    value
+                )
+
+
+    avg_funding = (
+        sum(funding_values)
+        / len(funding_values)
+        if funding_values
+        else None
     )
 
 
-def money(value):
+    # ----------------------------------------------
+    # LONG / SHORT RATIO
+    # ----------------------------------------------
 
-    if value >= 1_000_000_000:
-        return billions(value)
+    ls_values = []
 
-    if value >= 1_000_000:
-        return millions(value)
 
-    if value >= 1_000:
-        return thousands(value)
+    for symbol in ls_symbols:
 
-    return f"${value:.2f}"
+        row = (
+            ls_history
+            .get(symbol, {})
+            .get(timestamp)
+        )
+
+        if row is not None:
+
+            value = row.get("r")
+
+            if value is not None:
+
+                ls_values.append(
+                    value
+                )
+
+
+    avg_ls = (
+        sum(ls_values)
+        / len(ls_values)
+        if ls_values
+        else None
+    )
+
+
+    # ----------------------------------------------
+    # PRICE
+    # ----------------------------------------------
+
+    price_row = (
+        price_history
+        .get(
+            PRICE_SYMBOL,
+            {}
+        )
+        .get(timestamp)
+    )
+
+
+    price_close = (
+        price_row.get("c")
+        if price_row
+        else None
+    )
+
+
+    price_low = (
+        price_row.get("l")
+        if price_row
+        else None
+    )
+
+
+    # ----------------------------------------------
+    # OI DELTA
+    # ----------------------------------------------
+
+    delta_oi = None
+    delta_oi_pct = None
+
+
+    if (
+        total_oi is not None
+        and previous_oi is not None
+        and previous_oi != 0
+    ):
+
+        delta_oi = (
+            total_oi
+            - previous_oi
+        )
+
+        delta_oi_pct = (
+            delta_oi
+            / previous_oi
+            * 100
+        )
+
+
+    if total_oi is not None:
+
+        previous_oi = total_oi
+
+
+    # ----------------------------------------------
+    # SAVE ROW
+    # ----------------------------------------------
+
+    rows.append({
+
+        "timestamp": timestamp,
+
+        "utc": bucket_dt.strftime(
+            "%Y-%m-%d %H:%M"
+        ),
+
+        "eth_close": price_close,
+
+        "eth_low": price_low,
+
+        "oi_close_usd": total_oi,
+
+        "delta_oi_usd": delta_oi,
+
+        "delta_oi_pct": delta_oi_pct,
+
+        "short_liquidations_usd":
+            total_short_liq,
+
+        "long_liquidations_usd":
+            total_long_liq,
+
+        "ls_ratio": avg_ls,
+
+        "funding_rate": avg_funding,
+
+        "oi_contracts":
+            len(oi_values),
+
+        "liq_contracts":
+            liq_count,
+
+        "funding_contracts":
+            len(funding_values),
+
+        "ls_contracts":
+            len(ls_values)
+    })
 
 
 # ==================================================
-# OUTPUT
+# WRITE CSV
 # ==================================================
 
+filename = "eth_hourly.csv"
+
+
+fieldnames = [
+
+    "timestamp",
+    "utc",
+
+    "eth_close",
+    "eth_low",
+
+    "oi_close_usd",
+
+    "delta_oi_usd",
+    "delta_oi_pct",
+
+    "short_liquidations_usd",
+    "long_liquidations_usd",
+
+    "ls_ratio",
+    "funding_rate",
+
+    "oi_contracts",
+    "liq_contracts",
+    "funding_contracts",
+    "ls_contracts"
+]
+
+
+with open(
+    filename,
+    "w",
+    newline="",
+    encoding="utf-8"
+) as file:
+
+    writer = csv.DictWriter(
+        file,
+        fieldnames=fieldnames
+    )
+
+    writer.writeheader()
+
+    writer.writerows(rows)
+
+
+# ==================================================
+# SUMMARY
+# ==================================================
+
+valid_rows = [
+    row
+    for row in rows
+    if row["oi_close_usd"]
+    is not None
+]
+
+
 print("")
+print("==============================")
+print("ETH HOURLY DATABASE COMPLETE")
+print("==============================")
+
 print(
-    "ETH SQUEEZE WATCH AGGREGATE"
-)
-print(
-    "==========================="
+    "Requested hours:",
+    HOURS
 )
 
 print(
-    "Bucket:",
-    bucket_label
+    "Rows created:",
+    len(rows)
 )
+
+print(
+    "Rows with OI:",
+    len(valid_rows)
+)
+
+print(
+    "First bucket:",
+    rows[0]["utc"]
+)
+
+print(
+    "Last bucket:",
+    rows[-1]["utc"]
+)
+
 
 print("")
-
-
-# --------------------------------------------------
-# CONTRACTS
-# --------------------------------------------------
-
-print("CONTRACTS")
-print("---------")
-
-print(
-    "ETH contracts:",
-    len(symbols)
-)
-
-print(
-    "Perpetual contracts:",
-    len(perpetual_symbols)
-)
-
-print(
-    "Futures contracts:",
-    len(future_symbols)
-)
-
-print(
-    "Contracts with OI:",
-    len(oi)
-)
-
-print(
-    "Contracts with liquidation data:",
-    len(liq)
-)
-
-print("")
-
-
-# --------------------------------------------------
-# OPEN INTEREST
-# --------------------------------------------------
-
-print("OPEN INTEREST")
+print("LAST 10 HOURS")
 print("-------------")
 
-print(
-    "Perpetual OI:",
-    billions(perpetual_oi)
-)
 
-print(
-    "Futures OI:  ",
-    millions(futures_oi)
-)
+for row in rows[-10:]:
 
-print(
-    "ALL OI:      ",
-    billions(all_oi)
-)
+    oi_b = (
+        row["oi_close_usd"]
+        / 1_000_000_000
+        if row["oi_close_usd"]
+        is not None
+        else None
+    )
+
+    delta_m = (
+        row["delta_oi_usd"]
+        / 1_000_000
+        if row["delta_oi_usd"]
+        is not None
+        else None
+    )
+
+    print(
+        row["utc"],
+        "| Price:",
+        row["eth_close"],
+        "| OI:",
+        round(oi_b, 3)
+        if oi_b is not None
+        else None,
+        "B",
+        "| dOI:",
+        round(delta_m, 1)
+        if delta_m is not None
+        else None,
+        "M",
+        "| Short:",
+        round(
+            row["short_liquidations_usd"]
+            / 1_000_000,
+            3
+        )
+        if row[
+            "short_liquidations_usd"
+        ] is not None
+        else None,
+        "M",
+        "| Long:",
+        round(
+            row["long_liquidations_usd"]
+            / 1_000_000,
+            3
+        )
+        if row[
+            "long_liquidations_usd"
+        ] is not None
+        else None,
+        "M",
+        "| LS:",
+        round(
+            row["ls_ratio"],
+            4
+        )
+        if row["ls_ratio"]
+        is not None
+        else None,
+        "| Funding:",
+        round(
+            row["funding_rate"],
+            6
+        )
+        if row["funding_rate"]
+        is not None
+        else None
+    )
+
 
 print("")
-
-
-# --------------------------------------------------
-# LIQUIDATIONS
-# --------------------------------------------------
-
-print("LIQUIDATIONS")
-print("------------")
-
 print(
-    "Short liquidations:",
-    money(total_short_liq)
-)
-
-print(
-    "Long liquidations: ",
-    money(total_long_liq)
-)
-
-print("")
-
-
-# --------------------------------------------------
-# PRICE
-# --------------------------------------------------
-
-print("PRICE")
-print("-----")
-
-if price:
-
-    print(
-        "ETH Price Close:",
-        price.get("c")
-    )
-
-    print(
-        "ETH Price Low:  ",
-        price.get("l")
-    )
-
-else:
-
-    print(
-        "ETH Price Close: NO DATA"
-    )
-
-    print(
-        "ETH Price Low:   NO DATA"
-    )
-
-
-print("")
-print(
-    "COLLECTION COMPLETE"
+    "CSV saved:",
+    filename
 )
