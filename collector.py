@@ -4,6 +4,11 @@ import csv
 import requests
 from datetime import datetime, timezone, timedelta
 
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
 API_KEY = os.environ["COINALYZE_API_KEY"]
 
 HEADERS = {
@@ -12,14 +17,19 @@ HEADERS = {
 
 BASE = "https://api.coinalyze.net/v1"
 
-HOURS = 168
+CSV_FILE = "eth_hourly.csv"
 
+# Каждый запуск заново обновляет последние 7 суток.
+# Более старая история из CSV сохраняется.
+REFRESH_HOURS = 168
+
+# Стабильный reference price.
 PRICE_SYMBOL = "ETHUSDT_PERP.A"
 
 
-# ==================================================
+# ============================================================
 # TIME RANGE
-# ==================================================
+# ============================================================
 
 now = datetime.now(timezone.utc)
 
@@ -29,19 +39,20 @@ current_hour = now.replace(
     microsecond=0
 )
 
-# Последний полностью закрытый bucket
+# Последняя полностью закрытая свеча
 last_bucket = current_hour - timedelta(hours=1)
 
-# Нужны 168 закрытых часов включая последний
-first_bucket = last_bucket - timedelta(hours=HOURS - 1)
+first_bucket = last_bucket - timedelta(
+    hours=REFRESH_HOURS - 1
+)
 
 from_ts = int(first_bucket.timestamp())
 to_ts = int(last_bucket.timestamp()) + 3599
 
 
-# ==================================================
-# API REQUEST WITH RATE-LIMIT HANDLING
-# ==================================================
+# ============================================================
+# API REQUEST
+# ============================================================
 
 def api_get(endpoint, params=None):
 
@@ -77,15 +88,15 @@ def api_get(endpoint, params=None):
         return response.json()
 
 
-# ==================================================
-# MARKET LIST
-# ==================================================
+# ============================================================
+# MARKETS
+# ============================================================
+
+print("Loading markets...")
 
 markets = api_get("future-markets")
 
 
-# Те же базовые типы контрактов, которые
-# Coinalyze указывает для ETH aggregated OI.
 eth_markets = [
     market
     for market in markets
@@ -114,18 +125,26 @@ perpetual_symbols = [
 ls_symbols = [
     market["symbol"]
     for market in eth_markets
-    if market.get("has_long_short_ratio_data") is True
+    if market.get(
+        "has_long_short_ratio_data"
+    ) is True
 ]
 
 
 print("ETH contracts:", len(all_symbols))
-print("Perpetual contracts:", len(perpetual_symbols))
-print("L/S supported contracts:", len(ls_symbols))
+print(
+    "Perpetual contracts:",
+    len(perpetual_symbols)
+)
+print(
+    "L/S supported contracts:",
+    len(ls_symbols)
+)
 
 
-# ==================================================
-# HISTORY REQUEST
-# ==================================================
+# ============================================================
+# HISTORY DOWNLOAD
+# ============================================================
 
 def get_history(
     endpoint,
@@ -166,7 +185,8 @@ def get_history(
 
             symbol = item["symbol"]
 
-            result[symbol] = {}
+            if symbol not in result:
+                result[symbol] = {}
 
             for row in item.get(
                 "history",
@@ -174,18 +194,18 @@ def get_history(
             ):
 
                 result[symbol][
-                    row["t"]
+                    int(row["t"])
                 ] = row
 
     return result
 
 
-# ==================================================
-# DOWNLOAD DATA
-# ==================================================
+# ============================================================
+# DOWNLOAD ALL SERIES
+# ============================================================
 
 print("")
-print("Downloading OI...")
+print("Downloading Open Interest...")
 
 oi_history = get_history(
     "open-interest-history",
@@ -196,7 +216,7 @@ oi_history = get_history(
 )
 
 
-print("Downloading liquidations...")
+print("Downloading Liquidations...")
 
 liq_history = get_history(
     "liquidation-history",
@@ -207,7 +227,7 @@ liq_history = get_history(
 )
 
 
-print("Downloading funding...")
+print("Downloading Funding...")
 
 funding_history = get_history(
     "funding-rate-history",
@@ -215,7 +235,7 @@ funding_history = get_history(
 )
 
 
-print("Downloading L/S ratio...")
+print("Downloading L/S Ratio...")
 
 ls_history = get_history(
     "long-short-ratio-history",
@@ -223,7 +243,7 @@ ls_history = get_history(
 )
 
 
-print("Downloading price...")
+print("Downloading Price...")
 
 price_history = get_history(
     "ohlcv-history",
@@ -231,16 +251,16 @@ price_history = get_history(
 )
 
 
-# ==================================================
-# BUILD HOURLY DATABASE
-# ==================================================
+# ============================================================
+# BUILD NEW API ROWS
+# ============================================================
 
-rows = []
-
-previous_oi = None
+fresh_rows = {}
 
 
-for hour_index in range(HOURS):
+for hour_index in range(
+    REFRESH_HOURS
+):
 
     bucket_dt = (
         first_bucket
@@ -252,11 +272,11 @@ for hour_index in range(HOURS):
     )
 
 
-    # ----------------------------------------------
+    # --------------------------------------------------------
     # OPEN INTEREST
-    # ----------------------------------------------
+    # --------------------------------------------------------
 
-    oi_values = []
+    oi_by_symbol = {}
 
     for symbol in all_symbols:
 
@@ -266,28 +286,30 @@ for hour_index in range(HOURS):
             .get(timestamp)
         )
 
-        if row is not None:
+        if row is None:
+            continue
 
-            value = row.get("c")
+        value = row.get("c")
 
-            if value is not None:
-                oi_values.append(value)
+        if value is not None:
+            oi_by_symbol[symbol] = float(
+                value
+            )
 
 
     total_oi = (
-        sum(oi_values)
-        if oi_values
+        sum(oi_by_symbol.values())
+        if oi_by_symbol
         else None
     )
 
 
-    # ----------------------------------------------
+    # --------------------------------------------------------
     # LIQUIDATIONS
-    # ----------------------------------------------
+    # --------------------------------------------------------
 
-    total_short_liq = 0.0
-    total_long_liq = 0.0
-
+    short_liq = 0.0
+    long_liq = 0.0
     liq_count = 0
 
 
@@ -299,30 +321,32 @@ for hour_index in range(HOURS):
             .get(timestamp)
         )
 
-        if row is not None:
+        if row is None:
+            continue
 
-            total_short_liq += (
-                row.get("s", 0) or 0
-            )
+        short_liq += float(
+            row.get("s", 0) or 0
+        )
 
-            total_long_liq += (
-                row.get("l", 0) or 0
-            )
+        long_liq += float(
+            row.get("l", 0) or 0
+        )
 
-            liq_count += 1
+        liq_count += 1
 
 
     if liq_count == 0:
+        short_liq = None
+        long_liq = None
 
-        total_short_liq = None
-        total_long_liq = None
 
+    # --------------------------------------------------------
+    # FUNDING — OI WEIGHTED
+    # --------------------------------------------------------
 
-    # ----------------------------------------------
-    # FUNDING
-    # ----------------------------------------------
-
-    funding_values = []
+    funding_num = 0.0
+    funding_den = 0.0
+    funding_count = 0
 
 
     for symbol in perpetual_symbols:
@@ -333,30 +357,45 @@ for hour_index in range(HOURS):
             .get(timestamp)
         )
 
-        if row is not None:
+        if row is None:
+            continue
 
-            value = row.get("c")
+        value = row.get("c")
 
-            if value is not None:
+        if value is None:
+            continue
 
-                funding_values.append(
-                    value
-                )
+        weight = oi_by_symbol.get(
+            symbol
+        )
+
+        if weight is None:
+            continue
+
+        funding_num += (
+            float(value)
+            * weight
+        )
+
+        funding_den += weight
+
+        funding_count += 1
 
 
-    avg_funding = (
-        sum(funding_values)
-        / len(funding_values)
-        if funding_values
+    funding_rate = (
+        funding_num / funding_den
+        if funding_den > 0
         else None
     )
 
 
-    # ----------------------------------------------
-    # LONG / SHORT RATIO
-    # ----------------------------------------------
+    # --------------------------------------------------------
+    # LONG / SHORT RATIO — OI WEIGHTED
+    # --------------------------------------------------------
 
-    ls_values = []
+    ls_num = 0.0
+    ls_den = 0.0
+    ls_count = 0
 
 
     for symbol in ls_symbols:
@@ -367,28 +406,41 @@ for hour_index in range(HOURS):
             .get(timestamp)
         )
 
-        if row is not None:
+        if row is None:
+            continue
 
-            value = row.get("r")
+        value = row.get("r")
 
-            if value is not None:
+        if value is None:
+            continue
 
-                ls_values.append(
-                    value
-                )
+        weight = oi_by_symbol.get(
+            symbol
+        )
+
+        if weight is None:
+            continue
+
+        ls_num += (
+            float(value)
+            * weight
+        )
+
+        ls_den += weight
+
+        ls_count += 1
 
 
-    avg_ls = (
-        sum(ls_values)
-        / len(ls_values)
-        if ls_values
+    ls_ratio = (
+        ls_num / ls_den
+        if ls_den > 0
         else None
     )
 
 
-    # ----------------------------------------------
+    # --------------------------------------------------------
     # PRICE
-    # ----------------------------------------------
+    # --------------------------------------------------------
 
     price_row = (
         price_history
@@ -400,56 +452,29 @@ for hour_index in range(HOURS):
     )
 
 
-    price_close = (
-        price_row.get("c")
+    eth_close = (
+        float(price_row["c"])
         if price_row
+        and price_row.get("c")
+        is not None
         else None
     )
 
 
-    price_low = (
-        price_row.get("l")
+    eth_low = (
+        float(price_row["l"])
         if price_row
+        and price_row.get("l")
+        is not None
         else None
     )
 
 
-    # ----------------------------------------------
-    # OI DELTA
-    # ----------------------------------------------
+    # --------------------------------------------------------
+    # RAW ROW
+    # --------------------------------------------------------
 
-    delta_oi = None
-    delta_oi_pct = None
-
-
-    if (
-        total_oi is not None
-        and previous_oi is not None
-        and previous_oi != 0
-    ):
-
-        delta_oi = (
-            total_oi
-            - previous_oi
-        )
-
-        delta_oi_pct = (
-            delta_oi
-            / previous_oi
-            * 100
-        )
-
-
-    if total_oi is not None:
-
-        previous_oi = total_oi
-
-
-    # ----------------------------------------------
-    # SAVE ROW
-    # ----------------------------------------------
-
-    rows.append({
+    fresh_rows[timestamp] = {
 
         "timestamp": timestamp,
 
@@ -457,46 +482,442 @@ for hour_index in range(HOURS):
             "%Y-%m-%d %H:%M"
         ),
 
-        "eth_close": price_close,
+        "eth_close": eth_close,
 
-        "eth_low": price_low,
+        "eth_low": eth_low,
 
         "oi_close_usd": total_oi,
 
-        "delta_oi_usd": delta_oi,
-
-        "delta_oi_pct": delta_oi_pct,
-
         "short_liquidations_usd":
-            total_short_liq,
+            short_liq,
 
         "long_liquidations_usd":
-            total_long_liq,
+            long_liq,
 
-        "ls_ratio": avg_ls,
+        "ls_ratio": ls_ratio,
 
-        "funding_rate": avg_funding,
+        "funding_rate":
+            funding_rate,
 
         "oi_contracts":
-            len(oi_values),
+            len(oi_by_symbol),
 
         "liq_contracts":
             liq_count,
 
         "funding_contracts":
-            len(funding_values),
+            funding_count,
 
         "ls_contracts":
-            len(ls_values)
-    })
+            ls_count
+    }
 
 
-# ==================================================
-# WRITE CSV
-# ==================================================
+# ============================================================
+# LOAD EXISTING CSV
+# ============================================================
 
-filename = "eth_hourly.csv"
+database = {}
 
+
+if os.path.exists(CSV_FILE):
+
+    print("")
+    print(
+        "Loading existing database..."
+    )
+
+    with open(
+        CSV_FILE,
+        "r",
+        encoding="utf-8"
+    ) as file:
+
+        reader = csv.DictReader(file)
+
+        for row in reader:
+
+            try:
+
+                timestamp = int(
+                    float(row["timestamp"])
+                )
+
+            except (
+                KeyError,
+                ValueError,
+                TypeError
+            ):
+
+                continue
+
+
+            def old_float(name):
+
+                value = row.get(name)
+
+                if (
+                    value is None
+                    or value == ""
+                    or value == "None"
+                ):
+                    return None
+
+                try:
+                    return float(value)
+
+                except ValueError:
+                    return None
+
+
+            database[timestamp] = {
+
+                "timestamp":
+                    timestamp,
+
+                "utc":
+                    row.get(
+                        "utc",
+                        ""
+                    ),
+
+                "eth_close":
+                    old_float(
+                        "eth_close"
+                    ),
+
+                "eth_low":
+                    old_float(
+                        "eth_low"
+                    ),
+
+                "oi_close_usd":
+                    old_float(
+                        "oi_close_usd"
+                    ),
+
+                "short_liquidations_usd":
+                    old_float(
+                        "short_liquidations_usd"
+                    ),
+
+                "long_liquidations_usd":
+                    old_float(
+                        "long_liquidations_usd"
+                    ),
+
+                "ls_ratio":
+                    old_float(
+                        "ls_ratio"
+                    ),
+
+                "funding_rate":
+                    old_float(
+                        "funding_rate"
+                    ),
+
+                "oi_contracts":
+                    old_float(
+                        "oi_contracts"
+                    ),
+
+                "liq_contracts":
+                    old_float(
+                        "liq_contracts"
+                    ),
+
+                "funding_contracts":
+                    old_float(
+                        "funding_contracts"
+                    ),
+
+                "ls_contracts":
+                    old_float(
+                        "ls_contracts"
+                    )
+            }
+
+
+print(
+    "Existing rows:",
+    len(database)
+)
+
+
+# ============================================================
+# MERGE
+# Fresh API data replaces same timestamps.
+# Old history stays.
+# ============================================================
+
+database.update(
+    fresh_rows
+)
+
+
+timestamps = sorted(
+    database.keys()
+)
+
+
+rows = [
+    database[timestamp]
+    for timestamp in timestamps
+]
+
+
+# ============================================================
+# HELPERS FOR DYNAMICS
+# ============================================================
+
+def pct_change(
+    current,
+    previous
+):
+
+    if (
+        current is None
+        or previous is None
+        or previous == 0
+    ):
+        return None
+
+    return (
+        (current - previous)
+        / previous
+        * 100
+    )
+
+
+def absolute_change(
+    current,
+    previous
+):
+
+    if (
+        current is None
+        or previous is None
+    ):
+        return None
+
+    return current - previous
+
+
+def rolling_sum(
+    rows,
+    index,
+    field,
+    hours
+):
+
+    if index - hours + 1 < 0:
+        return None
+
+    values = []
+
+    for i in range(
+        index - hours + 1,
+        index + 1
+    ):
+
+        value = rows[i].get(
+            field
+        )
+
+        if value is None:
+            return None
+
+        values.append(value)
+
+    return sum(values)
+
+
+def prior_value(
+    rows,
+    index,
+    field,
+    hours_back
+):
+
+    target = (
+        index
+        - hours_back
+    )
+
+    if target < 0:
+        return None
+
+    return rows[target].get(
+        field
+    )
+
+
+# ============================================================
+# CALCULATE DYNAMICS
+# ============================================================
+
+for index, row in enumerate(rows):
+
+    price = row.get(
+        "eth_close"
+    )
+
+    oi = row.get(
+        "oi_close_usd"
+    )
+
+    ls = row.get(
+        "ls_ratio"
+    )
+
+    funding = row.get(
+        "funding_rate"
+    )
+
+
+    # --------------------------------------------------------
+    # PRICE
+    # --------------------------------------------------------
+
+    for hours in (
+        1,
+        3,
+        6,
+        24
+    ):
+
+        old_price = prior_value(
+            rows,
+            index,
+            "eth_close",
+            hours
+        )
+
+        row[
+            f"price_change_{hours}h_pct"
+        ] = pct_change(
+            price,
+            old_price
+        )
+
+
+    # --------------------------------------------------------
+    # OI
+    # --------------------------------------------------------
+
+    for hours in (
+        1,
+        3,
+        6,
+        24
+    ):
+
+        old_oi = prior_value(
+            rows,
+            index,
+            "oi_close_usd",
+            hours
+        )
+
+        row[
+            f"oi_change_{hours}h_usd"
+        ] = absolute_change(
+            oi,
+            old_oi
+        )
+
+        row[
+            f"oi_change_{hours}h_pct"
+        ] = pct_change(
+            oi,
+            old_oi
+        )
+
+
+    # --------------------------------------------------------
+    # LIQUIDATIONS
+    # --------------------------------------------------------
+
+    for hours in (
+        3,
+        6,
+        24
+    ):
+
+        row[
+            f"short_liq_{hours}h_usd"
+        ] = rolling_sum(
+            rows,
+            index,
+            "short_liquidations_usd",
+            hours
+        )
+
+        row[
+            f"long_liq_{hours}h_usd"
+        ] = rolling_sum(
+            rows,
+            index,
+            "long_liquidations_usd",
+            hours
+        )
+
+
+    # --------------------------------------------------------
+    # LONG / SHORT RATIO CHANGE
+    # --------------------------------------------------------
+
+    for hours in (
+        1,
+        3,
+        6,
+        24
+    ):
+
+        old_ls = prior_value(
+            rows,
+            index,
+            "ls_ratio",
+            hours
+        )
+
+        row[
+            f"ls_change_{hours}h"
+        ] = absolute_change(
+            ls,
+            old_ls
+        )
+
+
+    # --------------------------------------------------------
+    # FUNDING CHANGE
+    # --------------------------------------------------------
+
+    for hours in (
+        1,
+        3,
+        6,
+        24
+    ):
+
+        old_funding = prior_value(
+            rows,
+            index,
+            "funding_rate",
+            hours
+        )
+
+        row[
+            f"funding_change_{hours}h"
+        ] = absolute_change(
+            funding,
+            old_funding
+        )
+
+
+# ============================================================
+# CSV COLUMNS
+# ============================================================
 
 fieldnames = [
 
@@ -506,16 +927,50 @@ fieldnames = [
     "eth_close",
     "eth_low",
 
+    "price_change_1h_pct",
+    "price_change_3h_pct",
+    "price_change_6h_pct",
+    "price_change_24h_pct",
+
     "oi_close_usd",
 
-    "delta_oi_usd",
-    "delta_oi_pct",
+    "oi_change_1h_usd",
+    "oi_change_1h_pct",
+
+    "oi_change_3h_usd",
+    "oi_change_3h_pct",
+
+    "oi_change_6h_usd",
+    "oi_change_6h_pct",
+
+    "oi_change_24h_usd",
+    "oi_change_24h_pct",
 
     "short_liquidations_usd",
     "long_liquidations_usd",
 
+    "short_liq_3h_usd",
+    "long_liq_3h_usd",
+
+    "short_liq_6h_usd",
+    "long_liq_6h_usd",
+
+    "short_liq_24h_usd",
+    "long_liq_24h_usd",
+
     "ls_ratio",
+
+    "ls_change_1h",
+    "ls_change_3h",
+    "ls_change_6h",
+    "ls_change_24h",
+
     "funding_rate",
+
+    "funding_change_1h",
+    "funding_change_3h",
+    "funding_change_6h",
+    "funding_change_24h",
 
     "oi_contracts",
     "liq_contracts",
@@ -524,8 +979,12 @@ fieldnames = [
 ]
 
 
+# ============================================================
+# SAVE CSV
+# ============================================================
+
 with open(
-    filename,
+    CSV_FILE,
     "w",
     newline="",
     encoding="utf-8"
@@ -541,36 +1000,29 @@ with open(
     writer.writerows(rows)
 
 
-# ==================================================
-# SUMMARY
-# ==================================================
-
-valid_rows = [
-    row
-    for row in rows
-    if row["oi_close_usd"]
-    is not None
-]
-
+# ============================================================
+# REPORT
+# ============================================================
 
 print("")
-print("==============================")
-print("ETH HOURLY DATABASE COMPLETE")
-print("==============================")
-
 print(
-    "Requested hours:",
-    HOURS
+    "================================"
+)
+print(
+    "ETH DYNAMIC DATABASE COMPLETE"
+)
+print(
+    "================================"
 )
 
 print(
-    "Rows created:",
+    "Total rows:",
     len(rows)
 )
 
 print(
-    "Rows with OI:",
-    len(valid_rows)
+    "Fresh rows updated:",
+    len(fresh_rows)
 )
 
 print(
@@ -585,8 +1037,12 @@ print(
 
 
 print("")
-print("LAST 10 HOURS")
-print("-------------")
+print(
+    "LAST 10 HOURS"
+)
+print(
+    "-------------"
+)
 
 
 for row in rows[-10:]:
@@ -594,16 +1050,42 @@ for row in rows[-10:]:
     oi_b = (
         row["oi_close_usd"]
         / 1_000_000_000
-        if row["oi_close_usd"]
-        is not None
+        if row[
+            "oi_close_usd"
+        ] is not None
         else None
     )
 
-    delta_m = (
-        row["delta_oi_usd"]
+    doi_m = (
+        row[
+            "oi_change_1h_usd"
+        ]
         / 1_000_000
-        if row["delta_oi_usd"]
-        is not None
+        if row[
+            "oi_change_1h_usd"
+        ] is not None
+        else None
+    )
+
+    short_m = (
+        row[
+            "short_liquidations_usd"
+        ]
+        / 1_000_000
+        if row[
+            "short_liquidations_usd"
+        ] is not None
+        else None
+    )
+
+    long_m = (
+        row[
+            "long_liquidations_usd"
+        ]
+        / 1_000_000
+        if row[
+            "long_liquidations_usd"
+        ] is not None
         else None
     )
 
@@ -611,36 +1093,48 @@ for row in rows[-10:]:
         row["utc"],
         "| Price:",
         row["eth_close"],
+        "| Price 1h:",
+        round(
+            row[
+                "price_change_1h_pct"
+            ],
+            2
+        )
+        if row[
+            "price_change_1h_pct"
+        ] is not None
+        else None,
+        "%",
         "| OI:",
-        round(oi_b, 3)
+        round(
+            oi_b,
+            3
+        )
         if oi_b is not None
         else None,
         "B",
         "| dOI:",
-        round(delta_m, 1)
-        if delta_m is not None
+        round(
+            doi_m,
+            1
+        )
+        if doi_m is not None
         else None,
         "M",
         "| Short:",
         round(
-            row["short_liquidations_usd"]
-            / 1_000_000,
+            short_m,
             3
         )
-        if row[
-            "short_liquidations_usd"
-        ] is not None
+        if short_m is not None
         else None,
         "M",
         "| Long:",
         round(
-            row["long_liquidations_usd"]
-            / 1_000_000,
+            long_m,
             3
         )
-        if row[
-            "long_liquidations_usd"
-        ] is not None
+        if long_m is not None
         else None,
         "M",
         "| LS:",
@@ -648,22 +1142,24 @@ for row in rows[-10:]:
             row["ls_ratio"],
             4
         )
-        if row["ls_ratio"]
-        is not None
+        if row[
+            "ls_ratio"
+        ] is not None
         else None,
         "| Funding:",
         round(
             row["funding_rate"],
             6
         )
-        if row["funding_rate"]
-        is not None
+        if row[
+            "funding_rate"
+        ] is not None
         else None
     )
 
 
 print("")
 print(
-    "CSV saved:",
-    filename
+    "CSV updated:",
+    CSV_FILE
 )
