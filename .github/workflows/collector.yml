@@ -2,6 +2,11 @@ name: ETH Coinalyze Collector
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "7 * * * *"
+
+permissions:
+  contents: write
 
 jobs:
   collect:
@@ -23,3 +28,11 @@ jobs:
         env:
           COINALYZE_API_KEY: ${{ secrets.COINALYZE_API_KEY }}
         run: python collector.py
+
+      - name: Commit updated CSV
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add eth_hourly.csv
+          git diff --cached --quiet || git commit -m "Update ETH hourly data"
+          git push
