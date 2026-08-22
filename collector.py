@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 from datetime import datetime, timezone
 
@@ -6,170 +7,214 @@ API_KEY = os.environ["COINALYZE_API_KEY"]
 HEADERS = {"api_key": API_KEY}
 BASE = "https://api.coinalyze.net/v1"
 
+PRICE_SYMBOL = "ETHUSDT_PERP.A"  # Binance ETH/USDT perp
+
+# --------------------------------------------------
 # Последний полностью закрытый час UTC
+# --------------------------------------------------
+
 now = datetime.now(timezone.utc)
 current_hour = now.replace(minute=0, second=0, microsecond=0)
+
 bucket_start = int(current_hour.timestamp()) - 3600
 bucket_end = bucket_start + 3599
 
-# 1. Получаем полный список рынков
-r = requests.get(
-    f"{BASE}/future-markets",
-    headers=HEADERS,
-    timeout=30,
-)
-r.raise_for_status()
-markets = r.json()
+bucket_label = datetime.fromtimestamp(
+    bucket_start,
+    tz=timezone.utc
+).strftime("%Y-%m-%d %H:%M UTC")
 
-# Оставляем ETH и только валюты, используемые
-# в ETH aggregate Coinalyze
+
+# --------------------------------------------------
+# HTTP с автоматической обработкой rate limit
+# --------------------------------------------------
+
+def api_get(endpoint, params=None):
+    while True:
+        r = requests.get(
+            f"{BASE}/{endpoint}",
+            headers=HEADERS,
+            params=params,
+            timeout=30,
+        )
+
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", "60"))
+            print(f"Rate limit reached. Waiting {wait} sec...")
+            time.sleep(wait + 1)
+            continue
+
+        r.raise_for_status()
+        return r.json()
+
+
+# --------------------------------------------------
+# Получаем список ETH-контрактов
+# --------------------------------------------------
+
+markets = api_get("future-markets")
+
 eth_markets = [
     m for m in markets
     if m.get("base_asset") == "ETH"
     and m.get("quote_asset") in ("USD", "USDT", "BUSD")
 ]
 
-perpetual = [
-    m for m in eth_markets
+symbols = [m["symbol"] for m in eth_markets]
+
+perpetual_symbols = {
+    m["symbol"]
+    for m in eth_markets
     if m.get("is_perpetual") is True
-]
+}
 
-futures = [
-    m for m in eth_markets
+future_symbols = {
+    m["symbol"]
+    for m in eth_markets
     if m.get("is_perpetual") is False
-]
-
-print("")
-print("ETH AGGREGATE DIAGNOSTIC")
-print("========================")
-
-print(
-    "Bucket:",
-    datetime.fromtimestamp(
-        bucket_start,
-        tz=timezone.utc
-    ).strftime("%Y-%m-%d %H:%M UTC")
-)
-
-print("ETH contracts found:", len(eth_markets))
-print("Perpetual:", len(perpetual))
-print("Futures:", len(futures))
-print("")
+}
 
 
-def get_oi(markets_list):
-    """
-    Coinalyze limits requests by number of symbols.
-    Request in small batches.
-    """
-    results = {}
+# --------------------------------------------------
+# История батчами максимум по 20 symbols
+# --------------------------------------------------
 
-    symbols = [m["symbol"] for m in markets_list]
-
+def history_for_symbols(endpoint, symbols_list, extra=None):
+    result = {}
     batch_size = 20
 
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i + batch_size]
+    for i in range(0, len(symbols_list), batch_size):
+        batch = symbols_list[i:i + batch_size]
 
         params = {
             "symbols": ",".join(batch),
             "interval": "1hour",
             "from": bucket_start,
             "to": bucket_end,
-            "convert_to_usd": "true",
         }
 
-        r = requests.get(
-            f"{BASE}/open-interest-history",
-            headers=HEADERS,
-            params=params,
-            timeout=30,
-        )
+        if extra:
+            params.update(extra)
 
-        r.raise_for_status()
+        data = api_get(endpoint, params)
 
-        for item in r.json():
+        for item in data:
             history = item.get("history", [])
 
             if history:
-                results[item["symbol"]] = history[-1]["c"]
+                result[item["symbol"]] = history[-1]
 
-    return results
+    return result
 
 
-# 2. Получаем OI всех выбранных ETH-контрактов
-oi = get_oi(eth_markets)
+# --------------------------------------------------
+# 1. OPEN INTEREST
+# --------------------------------------------------
 
-perpetual_symbols = {
-    m["symbol"] for m in perpetual
-}
-
-future_symbols = {
-    m["symbol"] for m in futures
-}
+oi = history_for_symbols(
+    "open-interest-history",
+    symbols,
+    {"convert_to_usd": "true"},
+)
 
 perpetual_oi = sum(
-    value
-    for symbol, value in oi.items()
+    row["c"]
+    for symbol, row in oi.items()
     if symbol in perpetual_symbols
 )
 
 futures_oi = sum(
-    value
-    for symbol, value in oi.items()
+    row["c"]
+    for symbol, row in oi.items()
     if symbol in future_symbols
 )
 
 all_oi = perpetual_oi + futures_oi
 
 
+# --------------------------------------------------
+# 2. LIQUIDATIONS
+# --------------------------------------------------
+
+liq = history_for_symbols(
+    "liquidation-history",
+    symbols,
+    {"convert_to_usd": "true"},
+)
+
+total_long_liq = sum(
+    row["l"]
+    for row in liq.values()
+)
+
+total_short_liq = sum(
+    row["s"]
+    for row in liq.values()
+)
+
+
+# --------------------------------------------------
+# 3. PRICE
+# Пока берём Binance ETHUSDT как контрольную цену.
+# Позже сделаем Coinalyze-like Average.
+# --------------------------------------------------
+
+price_data = history_for_symbols(
+    "ohlcv-history",
+    [PRICE_SYMBOL],
+)
+
+price = price_data.get(PRICE_SYMBOL)
+
+
+# --------------------------------------------------
+# Форматирование
+# --------------------------------------------------
+
 def billions(value):
     return f"${value / 1_000_000_000:.3f}B"
 
 
 def millions(value):
-    return f"${value / 1_000_000:.1f}M"
+    return f"${value / 1_000_000:.3f}M"
 
 
-print("RESULT")
-print("------")
-
-print("PERPETUAL OI:", billions(perpetual_oi))
-print("FUTURES OI:  ", millions(futures_oi))
-print("ALL OI:      ", billions(all_oi))
+# --------------------------------------------------
+# OUTPUT
+# --------------------------------------------------
 
 print("")
+print("ETH SQUEEZE WATCH AGGREGATE")
+print("===========================")
+print("Bucket:", bucket_label)
+print("")
+
+print("CONTRACTS")
+print("---------")
+print("ETH contracts:", len(symbols))
 print("Contracts with OI:", len(oi))
+print("Contracts with liquidation data:", len(liq))
 print("")
 
-print("OI BY CONTRACT")
-print("--------------")
+print("OPEN INTEREST")
+print("-------------")
+print("Perpetual OI:", billions(perpetual_oi))
+print("Futures OI:  ", millions(futures_oi))
+print("ALL OI:      ", billions(all_oi))
+print("")
 
-# От большего OI к меньшему
-for symbol, value in sorted(
-    oi.items(),
-    key=lambda x: x[1],
-    reverse=True,
-):
-    market = next(
-        m for m in eth_markets
-        if m["symbol"] == symbol
-    )
+print("LIQUIDATIONS")
+print("------------")
+print("Short liquidations:", millions(total_short_liq))
+print("Long liquidations: ", millions(total_long_liq))
+print("")
 
-    contract_type = (
-        "PERP"
-        if market.get("is_perpetual")
-        else "FUT"
-    )
+print("PRICE")
+print("-----")
 
-    print(
-        symbol,
-        "|",
-        market.get("exchange"),
-        "|",
-        contract_type,
-        "|",
-        billions(value)
-        if value >= 1_000_000_000
-        else millions(value)
-    )
+if price:
+    print("ETH Price Close:", price["c"])
+    print("ETH Price Low:  ", price["l"])
+else:
+    print("ETH Price Close: NO DATA")
+    print("ETH Price Low:   NO DATA")
