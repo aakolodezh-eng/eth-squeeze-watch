@@ -19,16 +19,15 @@ BASE = "https://api.coinalyze.net/v1"
 
 CSV_FILE = "eth_hourly.csv"
 
-# Каждый запуск заново обновляет последние 7 суток.
-# Более старая история из CSV сохраняется.
-REFRESH_HOURS = 168
+# Обновляем только последние 3 полностью закрытых часа
+REFRESH_HOURS = 3
 
-# Стабильный reference price.
+# Стабильная reference-price серия
 PRICE_SYMBOL = "ETHUSDT_PERP.A"
 
 
 # ============================================================
-# TIME RANGE
+# TIME RANGE — STRICT UTC
 # ============================================================
 
 now = datetime.now(timezone.utc)
@@ -42,6 +41,7 @@ current_hour = now.replace(
 # Последняя полностью закрытая свеча
 last_bucket = current_hour - timedelta(hours=1)
 
+# Берём последние 3 закрытых часа
 first_bucket = last_bucket - timedelta(
     hours=REFRESH_HOURS - 1
 )
@@ -50,8 +50,21 @@ from_ts = int(first_bucket.timestamp())
 to_ts = int(last_bucket.timestamp()) + 3599
 
 
+# Диагностика времени
+print("")
+print("TIME DIAGNOSTICS")
+print("================")
+print("NOW UTC:", now.isoformat())
+print("CURRENT HOUR UTC:", current_hour.isoformat())
+print("FIRST REQUESTED BUCKET:", first_bucket.isoformat())
+print("LAST REQUESTED BUCKET:", last_bucket.isoformat())
+print("FROM TS:", from_ts)
+print("TO TS:", to_ts)
+print("")
+
+
 # ============================================================
-# API REQUEST
+# API
 # ============================================================
 
 def api_get(endpoint, params=None):
@@ -96,7 +109,6 @@ print("Loading markets...")
 
 markets = api_get("future-markets")
 
-
 eth_markets = [
     market
     for market in markets
@@ -108,12 +120,10 @@ eth_markets = [
     )
 ]
 
-
 all_symbols = [
     market["symbol"]
     for market in eth_markets
 ]
-
 
 perpetual_symbols = [
     market["symbol"]
@@ -121,36 +131,22 @@ perpetual_symbols = [
     if market.get("is_perpetual") is True
 ]
 
-
 ls_symbols = [
     market["symbol"]
     for market in eth_markets
-    if market.get(
-        "has_long_short_ratio_data"
-    ) is True
+    if market.get("has_long_short_ratio_data") is True
 ]
 
-
 print("ETH contracts:", len(all_symbols))
-print(
-    "Perpetual contracts:",
-    len(perpetual_symbols)
-)
-print(
-    "L/S supported contracts:",
-    len(ls_symbols)
-)
+print("Perpetual contracts:", len(perpetual_symbols))
+print("L/S supported contracts:", len(ls_symbols))
 
 
 # ============================================================
-# HISTORY DOWNLOAD
+# HISTORY
 # ============================================================
 
-def get_history(
-    endpoint,
-    symbols,
-    extra=None
-):
+def get_history(endpoint, symbols, extra=None):
 
     result = {}
 
@@ -185,8 +181,10 @@ def get_history(
 
             symbol = item["symbol"]
 
-            if symbol not in result:
-                result[symbol] = {}
+            result.setdefault(
+                symbol,
+                {}
+            )
 
             for row in item.get(
                 "history",
@@ -201,11 +199,11 @@ def get_history(
 
 
 # ============================================================
-# DOWNLOAD ALL SERIES
+# DOWNLOAD FRESH DATA
 # ============================================================
 
 print("")
-print("Downloading Open Interest...")
+print("Downloading OI...")
 
 oi_history = get_history(
     "open-interest-history",
@@ -215,8 +213,7 @@ oi_history = get_history(
     }
 )
 
-
-print("Downloading Liquidations...")
+print("Downloading liquidations...")
 
 liq_history = get_history(
     "liquidation-history",
@@ -226,24 +223,21 @@ liq_history = get_history(
     }
 )
 
-
-print("Downloading Funding...")
+print("Downloading funding...")
 
 funding_history = get_history(
     "funding-rate-history",
     perpetual_symbols
 )
 
-
-print("Downloading L/S Ratio...")
+print("Downloading L/S ratio...")
 
 ls_history = get_history(
     "long-short-ratio-history",
     ls_symbols
 )
 
-
-print("Downloading Price...")
+print("Downloading price...")
 
 price_history = get_history(
     "ohlcv-history",
@@ -252,11 +246,10 @@ price_history = get_history(
 
 
 # ============================================================
-# BUILD NEW API ROWS
+# BUILD FRESH ROWS
 # ============================================================
 
 fresh_rows = {}
-
 
 for hour_index in range(
     REFRESH_HOURS
@@ -273,7 +266,7 @@ for hour_index in range(
 
 
     # --------------------------------------------------------
-    # OPEN INTEREST
+    # OI
     # --------------------------------------------------------
 
     oi_by_symbol = {}
@@ -292,10 +285,10 @@ for hour_index in range(
         value = row.get("c")
 
         if value is not None:
+
             oi_by_symbol[symbol] = float(
                 value
             )
-
 
     total_oi = (
         sum(oi_by_symbol.values())
@@ -311,7 +304,6 @@ for hour_index in range(
     short_liq = 0.0
     long_liq = 0.0
     liq_count = 0
-
 
     for symbol in all_symbols:
 
@@ -334,8 +326,8 @@ for hour_index in range(
 
         liq_count += 1
 
-
     if liq_count == 0:
+
         short_liq = None
         long_liq = None
 
@@ -347,7 +339,6 @@ for hour_index in range(
     funding_num = 0.0
     funding_den = 0.0
     funding_count = 0
-
 
     for symbol in perpetual_symbols:
 
@@ -381,7 +372,6 @@ for hour_index in range(
 
         funding_count += 1
 
-
     funding_rate = (
         funding_num / funding_den
         if funding_den > 0
@@ -390,13 +380,12 @@ for hour_index in range(
 
 
     # --------------------------------------------------------
-    # LONG / SHORT RATIO — OI WEIGHTED
+    # L/S — OI WEIGHTED
     # --------------------------------------------------------
 
     ls_num = 0.0
     ls_den = 0.0
     ls_count = 0
-
 
     for symbol in ls_symbols:
 
@@ -430,7 +419,6 @@ for hour_index in range(
 
         ls_count += 1
 
-
     ls_ratio = (
         ls_num / ls_den
         if ls_den > 0
@@ -451,27 +439,23 @@ for hour_index in range(
         .get(timestamp)
     )
 
-
     eth_close = (
         float(price_row["c"])
         if price_row
-        and price_row.get("c")
-        is not None
+        and price_row.get("c") is not None
         else None
     )
-
 
     eth_low = (
         float(price_row["l"])
         if price_row
-        and price_row.get("l")
-        is not None
+        and price_row.get("l") is not None
         else None
     )
 
 
     # --------------------------------------------------------
-    # RAW ROW
+    # BUILD ROW
     # --------------------------------------------------------
 
     fresh_rows[timestamp] = {
@@ -494,7 +478,8 @@ for hour_index in range(
         "long_liquidations_usd":
             long_liq,
 
-        "ls_ratio": ls_ratio,
+        "ls_ratio":
+            ls_ratio,
 
         "funding_rate":
             funding_rate,
@@ -514,18 +499,46 @@ for hour_index in range(
 
 
 # ============================================================
-# LOAD EXISTING CSV
+# LOAD OLD DATABASE
 # ============================================================
 
 database = {}
+
+RAW_FIELDS = [
+    "eth_close",
+    "eth_low",
+    "oi_close_usd",
+    "short_liquidations_usd",
+    "long_liquidations_usd",
+    "ls_ratio",
+    "funding_rate",
+    "oi_contracts",
+    "liq_contracts",
+    "funding_contracts",
+    "ls_contracts"
+]
+
+
+def parse_float(value):
+
+    if (
+        value is None
+        or value == ""
+        or value == "None"
+    ):
+        return None
+
+    try:
+        return float(value)
+
+    except ValueError:
+        return None
 
 
 if os.path.exists(CSV_FILE):
 
     print("")
-    print(
-        "Loading existing database..."
-    )
+    print("Loading existing CSV...")
 
     with open(
         CSV_FILE,
@@ -540,7 +553,9 @@ if os.path.exists(CSV_FILE):
             try:
 
                 timestamp = int(
-                    float(row["timestamp"])
+                    float(
+                        row["timestamp"]
+                    )
                 )
 
             except (
@@ -551,91 +566,23 @@ if os.path.exists(CSV_FILE):
 
                 continue
 
-
-            def old_float(name):
-
-                value = row.get(name)
-
-                if (
-                    value is None
-                    or value == ""
-                    or value == "None"
-                ):
-                    return None
-
-                try:
-                    return float(value)
-
-                except ValueError:
-                    return None
-
-
             database[timestamp] = {
 
-                "timestamp":
-                    timestamp,
+                "timestamp": timestamp,
 
-                "utc":
-                    row.get(
-                        "utc",
-                        ""
-                    ),
-
-                "eth_close":
-                    old_float(
-                        "eth_close"
-                    ),
-
-                "eth_low":
-                    old_float(
-                        "eth_low"
-                    ),
-
-                "oi_close_usd":
-                    old_float(
-                        "oi_close_usd"
-                    ),
-
-                "short_liquidations_usd":
-                    old_float(
-                        "short_liquidations_usd"
-                    ),
-
-                "long_liquidations_usd":
-                    old_float(
-                        "long_liquidations_usd"
-                    ),
-
-                "ls_ratio":
-                    old_float(
-                        "ls_ratio"
-                    ),
-
-                "funding_rate":
-                    old_float(
-                        "funding_rate"
-                    ),
-
-                "oi_contracts":
-                    old_float(
-                        "oi_contracts"
-                    ),
-
-                "liq_contracts":
-                    old_float(
-                        "liq_contracts"
-                    ),
-
-                "funding_contracts":
-                    old_float(
-                        "funding_contracts"
-                    ),
-
-                "ls_contracts":
-                    old_float(
-                        "ls_contracts"
-                    )
+                "utc": row.get(
+                    "utc",
+                    ""
+                )
             }
+
+            for field in RAW_FIELDS:
+
+                database[
+                    timestamp
+                ][field] = parse_float(
+                    row.get(field)
+                )
 
 
 print(
@@ -645,20 +592,42 @@ print(
 
 
 # ============================================================
-# MERGE
-# Fresh API data replaces same timestamps.
-# Old history stays.
+# SMART MERGE
+#
+# Fresh None never overwrites an existing valid value
 # ============================================================
 
-database.update(
-    fresh_rows
-)
+for timestamp, fresh in fresh_rows.items():
 
+    if timestamp not in database:
+
+        database[timestamp] = fresh.copy()
+
+        continue
+
+    old = database[timestamp]
+
+    old["utc"] = fresh.get(
+        "utc",
+        old.get("utc", "")
+    )
+
+    for field in RAW_FIELDS:
+
+        new_value = fresh.get(field)
+
+        if new_value is not None:
+
+            old[field] = new_value
+
+
+# ============================================================
+# SORT DATABASE
+# ============================================================
 
 timestamps = sorted(
     database.keys()
 )
-
 
 rows = [
     database[timestamp]
@@ -667,7 +636,7 @@ rows = [
 
 
 # ============================================================
-# HELPERS FOR DYNAMICS
+# DYNAMICS HELPERS
 # ============================================================
 
 def pct_change(
@@ -703,6 +672,23 @@ def absolute_change(
     return current - previous
 
 
+def prior_value(
+    rows,
+    index,
+    field,
+    hours
+):
+
+    target = index - hours
+
+    if target < 0:
+        return None
+
+    return rows[target].get(
+        field
+    )
+
+
 def rolling_sum(
     rows,
     index,
@@ -710,13 +696,15 @@ def rolling_sum(
     hours
 ):
 
-    if index - hours + 1 < 0:
+    start = index - hours + 1
+
+    if start < 0:
         return None
 
     values = []
 
     for i in range(
-        index - hours + 1,
+        start,
         index + 1
     ):
 
@@ -730,26 +718,6 @@ def rolling_sum(
         values.append(value)
 
     return sum(values)
-
-
-def prior_value(
-    rows,
-    index,
-    field,
-    hours_back
-):
-
-    target = (
-        index
-        - hours_back
-    )
-
-    if target < 0:
-        return None
-
-    return rows[target].get(
-        field
-    )
 
 
 # ============================================================
@@ -774,11 +742,6 @@ for index, row in enumerate(rows):
         "funding_rate"
     )
 
-
-    # --------------------------------------------------------
-    # PRICE
-    # --------------------------------------------------------
-
     for hours in (
         1,
         3,
@@ -799,18 +762,6 @@ for index, row in enumerate(rows):
             price,
             old_price
         )
-
-
-    # --------------------------------------------------------
-    # OI
-    # --------------------------------------------------------
-
-    for hours in (
-        1,
-        3,
-        6,
-        24
-    ):
 
         old_oi = prior_value(
             rows,
@@ -833,10 +784,33 @@ for index, row in enumerate(rows):
             old_oi
         )
 
+        old_ls = prior_value(
+            rows,
+            index,
+            "ls_ratio",
+            hours
+        )
 
-    # --------------------------------------------------------
-    # LIQUIDATIONS
-    # --------------------------------------------------------
+        row[
+            f"ls_change_{hours}h"
+        ] = absolute_change(
+            ls,
+            old_ls
+        )
+
+        old_funding = prior_value(
+            rows,
+            index,
+            "funding_rate",
+            hours
+        )
+
+        row[
+            f"funding_change_{hours}h"
+        ] = absolute_change(
+            funding,
+            old_funding
+        )
 
     for hours in (
         3,
@@ -860,58 +834,6 @@ for index, row in enumerate(rows):
             index,
             "long_liquidations_usd",
             hours
-        )
-
-
-    # --------------------------------------------------------
-    # LONG / SHORT RATIO CHANGE
-    # --------------------------------------------------------
-
-    for hours in (
-        1,
-        3,
-        6,
-        24
-    ):
-
-        old_ls = prior_value(
-            rows,
-            index,
-            "ls_ratio",
-            hours
-        )
-
-        row[
-            f"ls_change_{hours}h"
-        ] = absolute_change(
-            ls,
-            old_ls
-        )
-
-
-    # --------------------------------------------------------
-    # FUNDING CHANGE
-    # --------------------------------------------------------
-
-    for hours in (
-        1,
-        3,
-        6,
-        24
-    ):
-
-        old_funding = prior_value(
-            rows,
-            index,
-            "funding_rate",
-            hours
-        )
-
-        row[
-            f"funding_change_{hours}h"
-        ] = absolute_change(
-            funding,
-            old_funding
         )
 
 
@@ -980,7 +902,7 @@ fieldnames = [
 
 
 # ============================================================
-# SAVE CSV
+# WRITE CSV
 # ============================================================
 
 with open(
@@ -1009,20 +931,20 @@ print(
     "================================"
 )
 print(
-    "ETH DYNAMIC DATABASE COMPLETE"
+    "ETH AUTO REFRESH COMPLETE"
 )
 print(
     "================================"
 )
 
 print(
-    "Total rows:",
+    "Total database rows:",
     len(rows)
 )
 
 print(
-    "Fresh rows updated:",
-    len(fresh_rows)
+    "Fresh hours checked:",
+    REFRESH_HOURS
 )
 
 print(
@@ -1035,128 +957,69 @@ print(
     rows[-1]["utc"]
 )
 
-
 print("")
 print(
-    "LAST 10 HOURS"
+    "LAST 6 HOURS"
 )
 print(
-    "-------------"
+    "------------"
 )
 
-
-for row in rows[-10:]:
-
-    oi_b = (
-        row["oi_close_usd"]
-        / 1_000_000_000
-        if row[
-            "oi_close_usd"
-        ] is not None
-        else None
-    )
-
-    doi_m = (
-        row[
-            "oi_change_1h_usd"
-        ]
-        / 1_000_000
-        if row[
-            "oi_change_1h_usd"
-        ] is not None
-        else None
-    )
-
-    short_m = (
-        row[
-            "short_liquidations_usd"
-        ]
-        / 1_000_000
-        if row[
-            "short_liquidations_usd"
-        ] is not None
-        else None
-    )
-
-    long_m = (
-        row[
-            "long_liquidations_usd"
-        ]
-        / 1_000_000
-        if row[
-            "long_liquidations_usd"
-        ] is not None
-        else None
-    )
+for row in rows[-6:]:
 
     print(
         row["utc"],
-        "| Price:",
+        "| Close:",
         row["eth_close"],
-        "| Price 1h:",
-        round(
-            row[
-                "price_change_1h_pct"
-            ],
-            2
-        )
-        if row[
-            "price_change_1h_pct"
-        ] is not None
-        else None,
-        "%",
+        "| Low:",
+        row["eth_low"],
         "| OI:",
         round(
-            oi_b,
+            row["oi_close_usd"]
+            / 1_000_000_000,
             3
         )
-        if oi_b is not None
+        if row.get(
+            "oi_close_usd"
+        ) is not None
         else None,
         "B",
         "| dOI:",
         round(
-            doi_m,
+            row["oi_change_1h_usd"]
+            / 1_000_000,
             1
         )
-        if doi_m is not None
+        if row.get(
+            "oi_change_1h_usd"
+        ) is not None
         else None,
         "M",
         "| Short:",
         round(
-            short_m,
+            row[
+                "short_liquidations_usd"
+            ] / 1_000_000,
             3
         )
-        if short_m is not None
+        if row.get(
+            "short_liquidations_usd"
+        ) is not None
         else None,
         "M",
         "| Long:",
         round(
-            long_m,
+            row[
+                "long_liquidations_usd"
+            ] / 1_000_000,
             3
         )
-        if long_m is not None
+        if row.get(
+            "long_liquidations_usd"
+        ) is not None
         else None,
-        "M",
-        "| LS:",
-        round(
-            row["ls_ratio"],
-            4
-        )
-        if row[
-            "ls_ratio"
-        ] is not None
-        else None,
-        "| Funding:",
-        round(
-            row["funding_rate"],
-            6
-        )
-        if row[
-            "funding_rate"
-        ] is not None
-        else None
+        "M"
     )
-
 
 print("")
 print(
