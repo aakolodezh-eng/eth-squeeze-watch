@@ -2,11 +2,16 @@ name: ETH Coinalyze Collector
 
 on:
   workflow_dispatch:
+
   schedule:
-    - cron: "7 * * * *"
+    - cron: "17,47 * * * *"
 
 permissions:
   contents: write
+
+concurrency:
+  group: eth-coinalyze-collector
+  cancel-in-progress: false
 
 jobs:
   collect:
