@@ -1,0 +1,67 @@
+name: Backfill ETH OHLC history
+
+on:
+  push:
+    paths:
+      - '.github/workflows/backfill_ohlc.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Backfill all existing hourly rows
+        env:
+          COINALYZE_API_KEY: ${{ secrets.COINALYZE_API_KEY }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+
+          p = Path('collector.py')
+          text = p.read_text(encoding='utf-8')
+
+          with open('eth_hourly.csv', 'r', encoding='utf-8') as f:
+              rows = list(csv.DictReader(f))
+
+          if not rows:
+              raise SystemExit('eth_hourly.csv is empty')
+
+          # Cover the complete existing database plus a small safety margin.
+          hours = len(rows) + 2
+          old = 'REFRESH_HOURS = 3'
+          if old not in text:
+              raise SystemExit('Expected REFRESH_HOURS setting not found')
+          text = text.replace(old, f'REFRESH_HOURS = {hours}', 1)
+          p.write_text(text, encoding='utf-8')
+          print(f'Temporary backfill window: {hours} hours')
+          PY
+
+          python collector.py
+
+          # Restore collector.py so normal hourly collection remains 3 hours.
+          git checkout -- collector.py
+
+      - name: Commit backfilled CSV
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add eth_hourly.csv
+          if git diff --cached --quiet; then
+            echo 'No CSV changes to commit'
+          else
+            git commit -m 'Backfill historical ETH OHLC and upper wicks'
+            git push
+          fi
